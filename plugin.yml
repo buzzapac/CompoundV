@@ -1,0 +1,94 @@
+package com.compoundv.tasks;
+
+import com.compoundv.CompoundVPlugin;
+import com.compoundv.PowerManager;
+import com.compoundv.PowerType;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
+import org.bukkit.entity.Player;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.scheduler.BukkitRunnable;
+
+import java.util.List;
+
+/**
+ * Runs every second (20 ticks).
+ * <ol>
+ *   <li>Prunes expired temp powers and notifies the player.</li>
+ *   <li>Refreshes passive potion effects so they never visually tick down.</li>
+ *   <li>Ensures flight is always re-granted if it was somehow lost.</li>
+ * </ol>
+ */
+public class PowerEffectTask extends BukkitRunnable {
+
+    // Refresh potion effects when they have fewer than this many ticks remaining
+    private static final int REFRESH_THRESHOLD = 100;
+    // How long to refresh effects to (keeps them effectively permanent without
+    // spamming MAX_VALUE which can cause client-side display oddities)
+    private static final int REFRESH_DURATION  = 20 * 60 * 10; // 10 minutes
+
+    private final CompoundVPlugin plugin;
+    private final PowerManager    powerManager;
+
+    public PowerEffectTask(CompoundVPlugin plugin, PowerManager powerManager) {
+        this.plugin       = plugin;
+        this.powerManager = powerManager;
+    }
+
+    @Override
+    public void run() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            // ── Expire temp powers ────────────────────────────────────────────
+            List<PowerType> expired = powerManager.pruneExpiredTempPowers(player);
+            for (PowerType p : expired) {
+                player.sendMessage(Component.text("⌛ Your ")
+                        .color(NamedTextColor.RED)
+                        .append(Component.text(p.getIcon() + " " + p.getDisplayName())
+                                .color(NamedTextColor.GOLD))
+                        .append(Component.text(" power has expired!")
+                                .color(NamedTextColor.RED)));
+            }
+
+            // ── Refresh passive effects ───────────────────────────────────────
+            if (powerManager.hasPower(player, PowerType.SUPER_SPEED)) {
+                refreshEffect(player, PotionEffectType.SPEED, 4);
+            }
+            if (powerManager.hasPower(player, PowerType.INVISIBILITY)) {
+                refreshEffect(player, PotionEffectType.INVISIBILITY, 0);
+            }
+            if (powerManager.hasPower(player, PowerType.SUPER_STRENGTH)) {
+                refreshEffect(player, PotionEffectType.STRENGTH, 4);
+                refreshEffect(player, PotionEffectType.JUMP_BOOST, 3);
+            }
+
+            // ── Ensure flight is active ───────────────────────────────────────
+            if (powerManager.hasPower(player, PowerType.FLIGHT)) {
+                if (player.getGameMode() != GameMode.CREATIVE
+                        && player.getGameMode() != GameMode.SPECTATOR) {
+                    if (!player.getAllowFlight()) {
+                        player.setAllowFlight(true);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Re-applies a potion effect if it is absent or nearly expired, using
+     * non-intrusive settings (no particles, no icon, not ambient).
+     */
+    private void refreshEffect(Player player, PotionEffectType type, int amplifier) {
+        PotionEffect existing = player.getPotionEffect(type);
+        if (existing == null || existing.getDuration() < REFRESH_THRESHOLD) {
+            player.addPotionEffect(
+                    new PotionEffect(type, REFRESH_DURATION, amplifier,
+                            false,  // ambient   – no cloud particles
+                            false,  // particles – no potion particles at all
+                            false)  // icon      – no HUD icon cluttering screen
+            );
+        }
+    }
+}

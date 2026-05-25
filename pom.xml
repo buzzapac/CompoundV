@@ -1,0 +1,455 @@
+package com.compoundv;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
+import org.bukkit.*;
+import org.bukkit.attribute.Attribute;
+import org.bukkit.attribute.AttributeInstance;
+import org.bukkit.attribute.AttributeModifier;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.EquipmentSlotGroup;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.PotionMeta;
+import org.bukkit.persistence.PersistentDataContainer;
+import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+
+import java.util.*;
+
+/**
+ * Manages all superpowers: PDC storage, effect application, cooldowns, and
+ * custom potion item creation.
+ */
+public class PowerManager {
+
+    // ── Duration constants ────────────────────────────────────────────────────
+    public static final long   TEMP_DURATION_MS    = 20L * 60 * 1000; // 20 minutes
+    public static final int    TEMP_DURATION_TICKS = 20 * 60 * 20;    // 20 minutes in ticks
+
+    // ── PDC Keys ─────────────────────────────────────────────────────────────
+    private final NamespacedKey PERM_POWERS_KEY;
+    private final NamespacedKey TEMP_POWERS_KEY;
+    private final NamespacedKey POTION_TYPE_KEY;
+    private final NamespacedKey SIZE_TOGGLE_KEY;
+    private final NamespacedKey SCALE_MOD_KEY;
+
+    // ── In-memory cooldown maps (reset on restart – intentional) ─────────────
+    private final Map<UUID, Long> laserCooldowns    = new HashMap<>();
+    private final Map<UUID, Long> teleportCooldowns = new HashMap<>();
+    // In-memory size toggle (backed to PDC for persistence)
+    private final Map<UUID, Boolean> sizeToggle     = new HashMap<>();
+
+    private final CompoundVPlugin plugin;
+
+    public PowerManager(CompoundVPlugin plugin) {
+        this.plugin         = plugin;
+        PERM_POWERS_KEY     = new NamespacedKey(plugin, "permanent_powers");
+        TEMP_POWERS_KEY     = new NamespacedKey(plugin, "temp_powers");
+        POTION_TYPE_KEY     = new NamespacedKey(plugin, "potion_type");
+        SIZE_TOGGLE_KEY     = new NamespacedKey(plugin, "size_toggle");
+        SCALE_MOD_KEY       = new NamespacedKey(plugin, "compound_v_scale");
+    }
+
+    // =========================================================================
+    //  POTION ITEM CREATION
+    // =========================================================================
+
+    /** Creates the green Temp V drinkable potion item. */
+    public ItemStack createTempV() {
+        ItemStack potion = new ItemStack(Material.POTION);
+        PotionMeta meta  = (PotionMeta) potion.getItemMeta();
+
+        meta.setColor(Color.fromRGB(0x00, 0xFF, 0x5A));
+        meta.displayName(Component.text("Temp V")
+                .color(NamedTextColor.GREEN)
+                .decoration(TextDecoration.ITALIC, false));
+
+        meta.lore(List.of(
+            Component.text("A temporary super-serum").color(NamedTextColor.GRAY)
+                .decoration(TextDecoration.ITALIC, false),
+            Component.empty(),
+            Component.text("⚗ Grants 20 minutes of a random superpower")
+                .color(NamedTextColor.YELLOW).decoration(TextDecoration.ITALIC, false),
+            Component.empty(),
+            Component.text("The green liquid pulses with energy...")
+                .color(NamedTextColor.DARK_GREEN).decoration(TextDecoration.ITALIC, true)
+        ));
+
+        meta.getPersistentDataContainer().set(POTION_TYPE_KEY, PersistentDataType.STRING, "TEMP_V");
+        potion.setItemMeta(meta);
+        return potion;
+    }
+
+    /** Creates the blue Compound V drinkable potion item. */
+    public ItemStack createCompoundV() {
+        ItemStack potion = new ItemStack(Material.POTION);
+        PotionMeta meta  = (PotionMeta) potion.getItemMeta();
+
+        meta.setColor(Color.fromRGB(0x00, 0x50, 0xFF));
+        meta.displayName(Component.text("Compound V")
+                .color(NamedTextColor.AQUA)
+                .decoration(TextDecoration.ITALIC, false));
+
+        meta.lore(List.of(
+            Component.text("The legendary super-serum").color(NamedTextColor.GRAY)
+                .decoration(TextDecoration.ITALIC, false),
+            Component.empty(),
+            Component.text("⚗ Permanently grants a power you don't yet possess")
+                .color(NamedTextColor.GOLD).decoration(TextDecoration.ITALIC, false),
+            Component.empty(),
+            Component.text("The blue liquid radiates raw, limitless power...")
+                .color(NamedTextColor.BLUE).decoration(TextDecoration.ITALIC, true)
+        ));
+
+        meta.getPersistentDataContainer().set(POTION_TYPE_KEY, PersistentDataType.STRING, "COMPOUND_V");
+        potion.setItemMeta(meta);
+        return potion;
+    }
+
+    public NamespacedKey getPotionTypeKey() { return POTION_TYPE_KEY; }
+
+    // =========================================================================
+    //  PERMANENT POWERS
+    // =========================================================================
+
+    public Set<PowerType> getPermanentPowers(Player player) {
+        PersistentDataContainer pdc = player.getPersistentDataContainer();
+        List<String> names = pdc.getOrDefault(
+                PERM_POWERS_KEY, PersistentDataType.LIST.strings(), Collections.emptyList());
+        Set<PowerType> result = new HashSet<>();
+        for (String name : names) {
+            try { result.add(PowerType.valueOf(name)); }
+            catch (IllegalArgumentException ignored) {}
+        }
+        return result;
+    }
+
+    public boolean hasPermanentPower(Player player, PowerType power) {
+        return getPermanentPowers(player).contains(power);
+    }
+
+    public void addPermanentPower(Player player, PowerType power) {
+        Set<PowerType> powers = getPermanentPowers(player);
+        powers.add(power);
+        savePermanentPowers(player, powers);
+        applyEffect(player, power, true);
+    }
+
+    public void removePermanentPower(Player player, PowerType power) {
+        Set<PowerType> powers = getPermanentPowers(player);
+        powers.remove(power);
+        savePermanentPowers(player, powers);
+        // Only actually remove the effect if they also lack a temp power
+        if (!hasTempPower(player, power)) {
+            removeEffect(player, power);
+        }
+    }
+
+    public void removeAllPermanentPowers(Player player) {
+        Set<PowerType> powers = getPermanentPowers(player);
+        savePermanentPowers(player, Collections.emptySet());
+        for (PowerType p : powers) {
+            if (!hasTempPower(player, p)) removeEffect(player, p);
+        }
+    }
+
+    private void savePermanentPowers(Player player, Set<PowerType> powers) {
+        List<String> names = new ArrayList<>();
+        for (PowerType p : powers) names.add(p.name());
+        player.getPersistentDataContainer().set(
+                PERM_POWERS_KEY, PersistentDataType.LIST.strings(), names);
+    }
+
+    // =========================================================================
+    //  TEMP POWERS  (stored as "POWER:expiryMs" strings)
+    // =========================================================================
+
+    public Map<PowerType, Long> getTempPowers(Player player) {
+        List<String> raw = player.getPersistentDataContainer()
+                .getOrDefault(TEMP_POWERS_KEY, PersistentDataType.LIST.strings(), Collections.emptyList());
+        Map<PowerType, Long> map = new HashMap<>();
+        for (String entry : raw) {
+            int sep = entry.lastIndexOf(':');
+            if (sep < 0) continue;
+            try {
+                PowerType pt = PowerType.valueOf(entry.substring(0, sep));
+                long exp     = Long.parseLong(entry.substring(sep + 1));
+                map.put(pt, exp);
+            } catch (Exception ignored) {}
+        }
+        return map;
+    }
+
+    public boolean hasTempPower(Player player, PowerType power) {
+        Long exp = getTempPowers(player).get(power);
+        return exp != null && System.currentTimeMillis() < exp;
+    }
+
+    public void addTempPower(Player player, PowerType power, long durationMs) {
+        Map<PowerType, Long> map = getTempPowers(player);
+        map.put(power, System.currentTimeMillis() + durationMs);
+        saveTempPowers(player, map);
+        applyEffect(player, power, false);
+    }
+
+    /** Returns true if the power expired and was removed. */
+    public boolean removeExpiredTempPower(Player player, PowerType power) {
+        Map<PowerType, Long> map = getTempPowers(player);
+        Long exp = map.get(power);
+        if (exp == null || System.currentTimeMillis() < exp) return false;
+        map.remove(power);
+        saveTempPowers(player, map);
+        if (!hasPermanentPower(player, power)) removeEffect(player, power);
+        return true;
+    }
+
+    /** Called from the periodic task – prunes all expired temp powers. */
+    public List<PowerType> pruneExpiredTempPowers(Player player) {
+        Map<PowerType, Long> map = getTempPowers(player);
+        List<PowerType> expired = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        for (Map.Entry<PowerType, Long> e : map.entrySet()) {
+            if (now >= e.getValue()) expired.add(e.getKey());
+        }
+        if (expired.isEmpty()) return expired;
+        for (PowerType p : expired) map.remove(p);
+        saveTempPowers(player, map);
+        for (PowerType p : expired) {
+            if (!hasPermanentPower(player, p)) removeEffect(player, p);
+        }
+        return expired;
+    }
+
+    private void saveTempPowers(Player player, Map<PowerType, Long> map) {
+        List<String> raw = new ArrayList<>();
+        for (Map.Entry<PowerType, Long> e : map.entrySet()) {
+            raw.add(e.getKey().name() + ":" + e.getValue());
+        }
+        player.getPersistentDataContainer().set(
+                TEMP_POWERS_KEY, PersistentDataType.LIST.strings(), raw);
+    }
+
+    // =========================================================================
+    //  COMBINED CHECK
+    // =========================================================================
+
+    public boolean hasPower(Player player, PowerType power) {
+        return hasPermanentPower(player, power) || hasTempPower(player, power);
+    }
+
+    // =========================================================================
+    //  POWER SELECTION HELPERS
+    // =========================================================================
+
+    /** For Temp V – any random power (may duplicate what they have). */
+    public PowerType randomPower() {
+        PowerType[] all = PowerType.values();
+        return all[new Random().nextInt(all.length)];
+    }
+
+    /** For Compound V – a power the player does NOT yet possess (permanent or temp). */
+    public PowerType randomUnownedPower(Player player) {
+        List<PowerType> available = new ArrayList<>();
+        for (PowerType p : PowerType.values()) {
+            if (!hasPower(player, p)) available.add(p);
+        }
+        if (available.isEmpty()) return null;
+        Collections.shuffle(available);
+        return available.get(0);
+    }
+
+    // =========================================================================
+    //  APPLY / REMOVE EFFECTS
+    // =========================================================================
+
+    /**
+     * Applies the in-game effect for a power.
+     *
+     * @param player    Target player
+     * @param power     Power to apply
+     * @param permanent If true, effects use Integer.MAX_VALUE duration
+     */
+    public void applyEffect(Player player, PowerType power, boolean permanent) {
+        int ticks = permanent ? Integer.MAX_VALUE : TEMP_DURATION_TICKS + 200; // small buffer
+
+        switch (power) {
+            case FLIGHT -> {
+                if (player.getGameMode() != GameMode.CREATIVE
+                        && player.getGameMode() != GameMode.SPECTATOR) {
+                    player.setAllowFlight(true);
+                    player.setFlying(true);
+                }
+            }
+            case SUPER_SPEED -> {
+                player.addPotionEffect(new PotionEffect(
+                        PotionEffectType.SPEED, ticks, 4, false, false, false));
+            }
+            case LASER_EYES -> {
+                // Active power — no passive effect; activated via right-click
+            }
+            case TELEPORTATION -> {
+                // Active power — activated via Sneak+Right-click
+            }
+            case INVISIBILITY -> {
+                player.addPotionEffect(new PotionEffect(
+                        PotionEffectType.INVISIBILITY, ticks, 0, false, false, false));
+            }
+            case SIZE_SHIFTING -> {
+                // Read stored preference; default = shrunk (false)
+                byte stored = player.getPersistentDataContainer()
+                        .getOrDefault(SIZE_TOGGLE_KEY, PersistentDataType.BYTE, (byte) 0);
+                boolean grown = (stored == 1);
+                sizeToggle.put(player.getUniqueId(), grown);
+                applyScaleModifier(player, grown ? 2.0 : 0.5);
+            }
+            case SUPER_STRENGTH -> {
+                player.addPotionEffect(new PotionEffect(
+                        PotionEffectType.STRENGTH, ticks, 4, false, false, false));
+                player.addPotionEffect(new PotionEffect(
+                        PotionEffectType.JUMP_BOOST, ticks, 3, false, false, false));
+            }
+        }
+    }
+
+    /** Removes the in-game effect for a power. */
+    public void removeEffect(Player player, PowerType power) {
+        switch (power) {
+            case FLIGHT -> {
+                if (player.getGameMode() != GameMode.CREATIVE
+                        && player.getGameMode() != GameMode.SPECTATOR) {
+                    player.setFlying(false);
+                    player.setAllowFlight(false);
+                }
+            }
+            case SUPER_SPEED   -> player.removePotionEffect(PotionEffectType.SPEED);
+            case LASER_EYES    -> {}
+            case TELEPORTATION -> {}
+            case INVISIBILITY  -> player.removePotionEffect(PotionEffectType.INVISIBILITY);
+            case SIZE_SHIFTING -> {
+                removeScaleModifier(player);
+                sizeToggle.remove(player.getUniqueId());
+                player.getPersistentDataContainer().remove(SIZE_TOGGLE_KEY);
+            }
+            case SUPER_STRENGTH -> {
+                player.removePotionEffect(PotionEffectType.STRENGTH);
+                player.removePotionEffect(PotionEffectType.JUMP_BOOST);
+            }
+        }
+    }
+
+    /**
+     * Re-applies every active power effect.
+     * Called on player join and respawn to restore effects after restart/death.
+     */
+    public void reapplyAllEffects(Player player) {
+        // Prune first so we don't reapply expired temps
+        Map<PowerType, Long> temps = getTempPowers(player);
+        long now = System.currentTimeMillis();
+
+        for (PowerType p : getPermanentPowers(player)) {
+            applyEffect(player, p, true);
+        }
+        for (Map.Entry<PowerType, Long> e : temps.entrySet()) {
+            if (now < e.getValue()) {
+                applyEffect(player, e.getKey(), false);
+            }
+        }
+    }
+
+    // =========================================================================
+    //  SIZE SHIFTING
+    // =========================================================================
+
+    /** Toggle the player between small (0.5×) and large (2.0×) size. */
+    public void toggleSize(Player player) {
+        boolean isGrown = sizeToggle.getOrDefault(player.getUniqueId(), false);
+        boolean nowGrown = !isGrown;
+        sizeToggle.put(player.getUniqueId(), nowGrown);
+        player.getPersistentDataContainer().set(
+                SIZE_TOGGLE_KEY, PersistentDataType.BYTE, nowGrown ? (byte) 1 : (byte) 0);
+        applyScaleModifier(player, nowGrown ? 2.0 : 0.5);
+
+        if (nowGrown) {
+            player.sendActionBar(Component.text("⬆ GIANT form activated!")
+                    .color(NamedTextColor.RED));
+        } else {
+            player.sendActionBar(Component.text("⬇ TINY form activated!")
+                    .color(NamedTextColor.GREEN));
+        }
+    }
+
+    private void applyScaleModifier(Player player, double scale) {
+        try {
+            AttributeInstance attr = player.getAttribute(Attribute.SCALE);
+            if (attr == null) return;
+            // Remove any existing compound_v scale modifier
+            removeScaleModifier(player);
+            // scale modifier: ADD_SCALAR means result = base * (1 + modifier)
+            // To get 0.5: modifier = -0.5   |   To get 2.0: modifier = 1.0
+            double modVal = scale - 1.0;
+            AttributeModifier mod = new AttributeModifier(
+                    SCALE_MOD_KEY,
+                    modVal,
+                    AttributeModifier.Operation.ADD_SCALAR,
+                    EquipmentSlotGroup.ANY
+            );
+            attr.addModifier(mod);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Could not apply scale modifier: " + e.getMessage());
+        }
+    }
+
+    private void removeScaleModifier(Player player) {
+        try {
+            AttributeInstance attr = player.getAttribute(Attribute.SCALE);
+            if (attr == null) return;
+            attr.getModifiers().stream()
+                    .filter(m -> SCALE_MOD_KEY.equals(m.getKey()))
+                    .findFirst()
+                    .ifPresent(attr::removeModifier);
+        } catch (Exception ignored) {}
+    }
+
+    // =========================================================================
+    //  COOLDOWNS
+    // =========================================================================
+
+    public boolean isOnLaserCooldown(Player player) {
+        Long cd = laserCooldowns.get(player.getUniqueId());
+        return cd != null && System.currentTimeMillis() < cd;
+    }
+
+    public long laserCooldownRemaining(Player player) {
+        Long cd = laserCooldowns.get(player.getUniqueId());
+        if (cd == null) return 0;
+        return Math.max(0, cd - System.currentTimeMillis());
+    }
+
+    public void setLaserCooldown(Player player, long ms) {
+        laserCooldowns.put(player.getUniqueId(), System.currentTimeMillis() + ms);
+    }
+
+    public boolean isOnTeleportCooldown(Player player) {
+        Long cd = teleportCooldowns.get(player.getUniqueId());
+        return cd != null && System.currentTimeMillis() < cd;
+    }
+
+    public long teleportCooldownRemaining(Player player) {
+        Long cd = teleportCooldowns.get(player.getUniqueId());
+        if (cd == null) return 0;
+        return Math.max(0, cd - System.currentTimeMillis());
+    }
+
+    public void setTeleportCooldown(Player player, long ms) {
+        teleportCooldowns.put(player.getUniqueId(), System.currentTimeMillis() + ms);
+    }
+
+    /** Clean up when a player disconnects. */
+    public void cleanupPlayer(UUID uuid) {
+        laserCooldowns.remove(uuid);
+        teleportCooldowns.remove(uuid);
+        sizeToggle.remove(uuid);
+    }
+}
